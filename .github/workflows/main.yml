@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+  NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_KEY }}
   RDP_USER: admin
   RDP_PASS: ${{ secrets.RDP_PASS }}
 
@@ -21,24 +21,45 @@ jobs:
       - name: Setup Windows Remote Desktop
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
+          # bypass local password complexity policy so RDP_PASS always works
+          secedit /export /cfg C:\secpol.cfg | Out-Null
+          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' |
+            Set-Content C:\secpol.cfg
+          (Get-Content C:\secpol.cfg) -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0' |
+            Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item C:\secpol.cfg -ErrorAction SilentlyContinue
+
+          if ([string]::IsNullOrEmpty($env:RDP_PASS)) {
+            throw "RDP_PASS secret is empty. Set it in repo Settings > Secrets and variables > Actions."
+          }
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
+          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+
           if ("$env:RDP_USER" -eq "runneradmin") {
             Write-Host "Warning: Using default user account!"
-            Set-LocalUser -Name $env:RDP_USER -Password (ConvertTo-SecureString "$env:RDP_PASS" -AsPlainText -Force)
+            Set-LocalUser -Name $env:RDP_USER -Password $securePass
           } else {
-            New-LocalUser -Name "$env:RDP_USER" -Password (ConvertTo-SecureString "$env:RDP_PASS" -AsPlainText -Force) *>$null
-            Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER"
-            Enable-LocalUser -Name "$env:RDP_USER"
+            if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $env:RDP_USER -Password $securePass
+            } else {
+              New-LocalUser -Name $env:RDP_USER -Password $securePass | Out-Null
+            }
+            Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+            Enable-LocalUser -Name $env:RDP_USER
           }
 
           icacls "C:\Windows\Temp" /grant "$env:RDP_USER`:F" *>$null
           icacls "C:\Windows\installer" /grant "$env:RDP_USER`:F" *>$null
 
-          Set-Service -Name "W32Time" -StartupType Automatic -ErrorAction SilentlyContinue *>$null
-          Restart-Service W32Time -ErrorAction SilentlyContinue *>$null
+          Set-Service -Name "W32Time" -StartupType Automatic -ErrorAction SilentlyContinue
+          Restart-Service W32Time -ErrorAction SilentlyContinue
           w32tm /resync /force *>$null
           w32tm /config /manualpeerlist:"time.windows.com" /syncfromflags:manual /reliable:yes /update *>$null
 
@@ -54,12 +75,15 @@ jobs:
             }
             (New-Object -ComObject Shell.Application).MinimizeAll()
           } catch {}
-          $ErrorActionPreference = 'Stop'
           exit 0
 
       - name: Install and Configure Ngrok
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:NGROK_AUTH_TOKEN)) {
+            throw "NGROK_AUTH_KEY secret is empty. Set it in repo Settings > Secrets and variables > Actions."
+          }
           Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
           Expand-Archive ngrok.zip -DestinationPath .\ngrok
           .\ngrok\ngrok.exe authtoken $env:NGROK_AUTH_TOKEN
@@ -72,7 +96,10 @@ jobs:
           $success = $false
 
           while (-not $success -and $retryCount -lt $maxRetries) {
-            Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
+            Remove-Item ".\ngrok.log", ".\ngrok.err" -ErrorAction SilentlyContinue
+            Start-Process -FilePath ".\ngrok\ngrok.exe" `
+              -ArgumentList "tcp 3389 --log=stdout --log-format=logfmt" `
+              -WindowStyle Hidden -RedirectStandardOutput ".\ngrok.log" -RedirectStandardError ".\ngrok.err"
 
             $attempts = 0
             $maxAttempts = 10
@@ -81,7 +108,6 @@ jobs:
             while (-not $ngrokUrl -and $attempts -lt $maxAttempts) {
               Start-Sleep -Seconds 5
               $attempts++
-
               try {
                 $tunnels = Invoke-RestMethod -Uri http://localhost:4040/api/tunnels
                 $ngrokUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' }).public_url
@@ -92,6 +118,10 @@ jobs:
 
             if (-not $ngrokUrl) {
               Write-Host "Failed to retrieve Ngrok URL after $maxAttempts attempts."
+              Write-Host "--- ngrok.log ---"
+              Get-Content ".\ngrok.log" -ErrorAction SilentlyContinue
+              Write-Host "--- ngrok.err ---"
+              Get-Content ".\ngrok.err" -ErrorAction SilentlyContinue
               Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
               $retryCount++
               continue
@@ -117,16 +147,19 @@ jobs:
           }
 
           if (-not $success) {
+            Write-Host "--- final ngrok.log ---"
+            Get-Content ".\ngrok.log" -ErrorAction SilentlyContinue
+            Write-Host "--- final ngrok.err ---"
+            Get-Content ".\ngrok.err" -ErrorAction SilentlyContinue
             throw "Failed to establish a working Ngrok tunnel after $maxRetries attempts."
           }
 
       - name: Keep Alive
         shell: pwsh
         run: |
-          $duration = 21600  # 6 hours
-          $interval = 300    # check every 5 minutes
+          $duration = 21600
+          $interval = 300
           $endTime = (Get-Date).AddSeconds($duration)
-
           while ((Get-Date) -lt $endTime) {
             $ngrokProcess = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
             if (-not $ngrokProcess) {
